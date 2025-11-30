@@ -1,0 +1,141 @@
+//@version=6
+indicator(title="RSI & MACD Split-View (Fixed)", shorttitle="RSI/MACD Split", format=format.price, precision=2, timeframe="", timeframe_gaps=true)
+
+// ==========================================
+// 1. RSI Inputs (Top Panel)
+// ==========================================
+rsiLengthInput = input.int(14, minval=1, title="RSI Length", group="RSI Settings")
+rsiSourceInput = input.source(close, "Source", group="RSI Settings")
+calculateDivergence = input.bool(false, title="Show Divergence", group="RSI Settings")
+
+change = ta.change(rsiSourceInput)
+up = ta.rma(math.max(change, 0), rsiLengthInput)
+down = ta.rma(-math.min(change, 0), rsiLengthInput)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+
+// ==========================================
+// 2. MACD Inputs & Calculation
+// ==========================================
+GRP_MACD = "MACD Settings"
+fast_length = input(title = "Fast Length", defval = 12, group=GRP_MACD)
+slow_length = input(title = "Slow Length", defval = 26, group=GRP_MACD)
+src = input(title = "Source", defval = close, group=GRP_MACD)
+signal_length = input.int(title = "Signal Smoothing", minval = 1, maxval = 50, defval = 9, group=GRP_MACD)
+sma_source = input.string(title = "Oscillator MA Type", defval = "EMA", options = ["SMA", "EMA"], group=GRP_MACD)
+sma_signal = input.string(title = "Signal Line MA Type", defval = "EMA", options = ["SMA", "EMA"], group=GRP_MACD)
+
+// Calculation
+fast_ma = sma_source == "SMA" ? ta.sma(src, fast_length) : ta.ema(src, fast_length)
+slow_ma = sma_source == "SMA" ? ta.sma(src, slow_length) : ta.ema(src, slow_length)
+macd_raw = fast_ma - slow_ma
+signal_raw = sma_signal == "SMA" ? ta.sma(macd_raw, signal_length) : ta.ema(macd_raw, signal_length)
+
+// ==========================================
+// 3. MACD Normalization & Shift (The Fix)
+// ==========================================
+GRP_VISUAL = "Visual Layout"
+norm_period = input.int(150, "Normalization Lookback", group=GRP_VISUAL)
+norm_mult = input.float(1.5, "MACD Vertical Size", step=0.1, group=GRP_VISUAL)
+
+// 1. Find Max Range to Normalize
+highest_abs = ta.highest(math.abs(macd_raw), norm_period)
+scale_factor = highest_abs != 0 ? highest_abs : 1
+
+// 2. Define the "Basement" Center
+// We set the MACD Zero Line to -50.
+offset_y = -50 
+
+// 3. Normalize and Shift
+// Values will oscillate around -50.
+macd_final = offset_y + ((macd_raw / scale_factor) * 25 * norm_mult)
+sig_final  = offset_y + ((signal_raw / scale_factor) * 25 * norm_mult)
+hist_val   = macd_final - sig_final 
+
+// ==========================================
+// 4. Drawing - Top Zone (RSI)
+// ==========================================
+h70 = hline(70, "RSI Upper", color=#787B86)
+h30 = hline(30, "RSI Lower", color=#787B86)
+fill(h70, h30, color=color.rgb(126, 87, 194, 90), title="RSI Background")
+plot(rsi, "RSI", color=#7E57C2, linewidth=2)
+
+// RSI Smoothing
+GRP_SMOOTH = "RSI Smoothing"
+maTypeInput = input.string("SMA", "Type", options = ["None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = GRP_SMOOTH)
+maLengthInput = input.int(14, "Length", group = GRP_SMOOTH)
+bbMultInput = input.float(2.0, "BB StdDev", group = GRP_SMOOTH)
+var enableMA = maTypeInput != "None"
+var isBB = maTypeInput == "SMA + Bollinger Bands"
+ma(source, length, MAtype) =>
+    switch MAtype
+        "SMA"                   => ta.sma(source, length)
+        "SMA + Bollinger Bands" => ta.sma(source, length)
+        "EMA"                   => ta.ema(source, length)
+        "SMMA (RMA)"            => ta.rma(source, length)
+        "WMA"                   => ta.wma(source, length)
+        "VWMA"                  => ta.vwma(source, length)
+        => na
+smoothingMA = enableMA ? ma(rsi, maLengthInput, maTypeInput) : na
+smoothingStDev = isBB ? ta.stdev(rsi, maLengthInput) * bbMultInput : na
+plot(smoothingMA, "RSI MA", color=color.yellow, display = enableMA ? display.all : display.none)
+p1 = plot(isBB ? smoothingMA + smoothingStDev : na, "BB Upper", color=color.green, display = isBB ? display.all : display.none)
+p2 = plot(isBB ? smoothingMA - smoothingStDev : na, "BB Lower", color=color.green, display = isBB ? display.all : display.none)
+fill(p1, p2, color=color.new(color.green, 90), title="BB Fill")
+
+// ==========================================
+// 5. Drawing - Bottom Zone (MACD)
+// ==========================================
+// Zone Separator (The line between RSI and MACD)
+hline(0, "Zone Separator", color=color.white, linestyle=hline.style_solid, linewidth=1)
+
+// The MACD Zero Line (Centered at -50)
+zeroLinePlot = plot(offset_y, "MACD Zero Line", color=color.new(#787B86, 30), style=plot.style_line)
+
+// MACD Histogram (Using Area Fill instead of Columns)
+// We calculate the top of the histogram relative to the offset
+hist_top = offset_y + (macd_final - sig_final)
+
+// Determine color based on rising/falling
+histColor = (hist_top >= offset_y ? (hist_top[1] < hist_top ? #26A69A : #B2DFDB) : (hist_top[1] < hist_top ? #FFCDD2 : #FF5252))
+
+// Plot the top edge of histogram (hidden line)
+histPlot = plot(hist_top, "Hist Top", display=display.none)
+
+// Fill between the Top edge and the Zero Line (-50)
+fill(histPlot, zeroLinePlot, color=color.new(histColor, 20), title="MACD Histogram Area")
+
+// MACD Lines
+plot(macd_final, title = "MACD Line", color = #2962FF, linewidth=1)
+plot(sig_final, title = "Signal Line", color = #FF6D00, linewidth=1)
+
+// ==========================================
+// 6. Divergence (RSI)
+// ==========================================
+lookbackRight = 5
+lookbackLeft = 5
+rangeUpper = 60
+rangeLower = 5
+_inRange(bool cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+plFound = false
+phFound = false
+bullCond = false
+bearCond = false
+rsiLBR = rsi[lookbackRight]
+if calculateDivergence
+    plFound := not na(ta.pivotlow(rsi, lookbackLeft, lookbackRight))    
+    rsiHL = rsiLBR > ta.valuewhen(plFound, rsiLBR, 1) and _inRange(plFound[1])
+    lowLBR = low[lookbackRight]
+    priceLL = lowLBR < ta.valuewhen(plFound, lowLBR, 1)
+    bullCond := priceLL and rsiHL and plFound
+    phFound := not na(ta.pivothigh(rsi, lookbackLeft, lookbackRight))
+    rsiLH = rsiLBR < ta.valuewhen(phFound, rsiLBR, 1) and _inRange(phFound[1])
+    highLBR = high[lookbackRight]
+    priceHH = highLBR > ta.valuewhen(phFound, highLBR, 1)
+    bearCond := priceHH and rsiLH and phFound
+plotshape(bullCond ? rsiLBR : na, offset = -lookbackRight, title = "Bull Label", text = " Bull ", style = shape.labelup, location = location.absolute, color = color.green, textcolor = color.white)
+plotshape(bearCond ? rsiLBR : na, offset = -lookbackRight, title = "Bear Label", text = " Bear ", style = shape.labeldown, location = location.absolute, color = color.red, textcolor = color.white)
+
+alertcondition(bullCond, title='Bullish Div', message="RSI Bullish Divergence")
+alertcondition(bearCond, title='Bearish Div', message='RSI Bearish Divergence')
