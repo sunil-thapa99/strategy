@@ -1,0 +1,209 @@
+//@version=6
+strategy(
+     title = "15min ORB Retest Strategy with EMA Filter",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 2,
+     pyramiding = 0
+)
+
+// =====================================================
+// INPUTS
+// =====================================================
+orbMinutes = input.int(15, "ORB Duration (minutes)", minval = 5, group="ORB Settings")
+
+// EMA Settings
+emaFast = input.int(9, "EMA Fast Length", minval=1, group="EMA Settings")
+emaSlow = input.int(20, "EMA Slow Length", minval=1, group="EMA Settings")
+
+// Risk Management
+riskPips = input.float(50, "Risk (pips)", minval=1, step=1, group="Risk Management")
+riskRewardRatio = input.float(1.0, "Risk:Reward Ratio", minval=1.0, maxval=5.0, step=0.5, group="Risk Management")
+
+// =====================================================
+// DAY RESET
+// =====================================================
+isNewDay = dayofmonth != dayofmonth[1]
+
+// =====================================================
+// ORB — NY SESSION OPEN (9:30 AM EST)
+// =====================================================
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbDone = false
+var bool  breakoutOccurred = false
+var bool  retestValid = false
+var string direction = na
+var bool  waitingForRetest = false
+
+if isNewDay
+    orbHigh := na
+    orbLow  := na
+    orbDone := false
+    breakoutOccurred := false
+    retestValid := false
+    direction := na
+    waitingForRetest := false
+
+orbStart = timestamp("America/New_York", year, month, dayofmonth, 3, 00)
+orbEnd   = orbStart + orbMinutes * 60 * 1000
+
+// Mark ORB High and Low during the 15-minute period
+if time >= orbStart and time <= orbEnd
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow, low)
+
+if time > orbEnd
+    orbDone := true
+
+// =====================================================
+// 5-MINUTE TIMEFRAME DATA
+// =====================================================
+[htf5m_high, htf5m_low, htf5m_open, htf5m_close, htf5m_time] = request.security(
+     syminfo.tickerid, 
+     "5", 
+     [high, low, open, close, time], 
+     lookahead=barmerge.lookahead_off
+)
+
+// Detect when a new 5-minute candle closes
+isNew5mCandle = ta.change(htf5m_time) != 0
+
+// =====================================================
+// EMA CALCULATION
+// =====================================================
+ema10 = ta.ema(close, emaFast)
+ema20 = ta.ema(close, emaSlow)
+
+// =====================================================
+// BREAKOUT DETECTION
+// =====================================================
+if orbDone and not breakoutOccurred
+    if high > orbHigh
+        breakoutOccurred := true
+        direction := "long"
+    else if low < orbLow
+        breakoutOccurred := true
+        direction := "short"
+
+// =====================================================
+// RETEST CONFIRMATION (5-MINUTE TIMEFRAME CLOSE)
+// =====================================================
+// After breakout occurs, detect when price retests the ORB level
+// Long: Price breaks above ORB high, then comes back and touches ORB high
+longBreakoutHappened = breakoutOccurred and direction == "long" and high > orbHigh
+longRetestTouch = longBreakoutHappened[1] and htf5m_low <= orbHigh
+
+// Short: Price breaks below ORB low, then comes back and touches ORB low
+shortBreakoutHappened = breakoutOccurred and direction == "short" and low < orbLow
+shortRetestTouch = shortBreakoutHappened[1] and htf5m_high >= orbLow
+
+// When retest touches ORB level, start waiting for 5m candle close
+if longRetestTouch and not waitingForRetest
+    waitingForRetest := true
+    direction := "long"
+
+if shortRetestTouch and not waitingForRetest
+    waitingForRetest := true
+    direction := "short"
+
+// Check if 5-minute candle closes properly on retest
+longRetestClose = waitingForRetest and direction == "long" and isNew5mCandle and htf5m_close > orbHigh
+shortRetestClose = waitingForRetest and direction == "short" and isNew5mCandle and htf5m_close < orbLow
+
+// If retest closes properly, validate it
+if longRetestClose
+    retestValid := true
+    direction := "long"
+    waitingForRetest := false
+
+if shortRetestClose
+    retestValid := true
+    direction := "short"
+    waitingForRetest := false
+
+// If 5-minute candle closes but doesn't meet retest criteria, reset and wait for new breakout
+if waitingForRetest and isNew5mCandle
+    if direction == "long" and htf5m_close <= orbHigh
+        // Retest failed - reset and wait for new breakout
+        waitingForRetest := false
+        breakoutOccurred := false
+        direction := na
+        retestValid := false
+    
+    if direction == "short" and htf5m_close >= orbLow
+        // Retest failed - reset and wait for new breakout
+        waitingForRetest := false
+        breakoutOccurred := false
+        direction := na
+        retestValid := false
+
+// =====================================================
+// EMA FILTER
+// =====================================================
+emaLongOK = ema10 > ema20   // For long: EMA 10 must be above EMA 20
+emaShortOK = ema10 < ema20  // For short: EMA 10 must be below EMA 20
+
+// =====================================================
+// ENTRY CONDITIONS
+// =====================================================
+longEntry = retestValid and direction == "long" and emaLongOK
+shortEntry = retestValid and direction == "short" and emaShortOK
+
+// =====================================================
+// RISK MANAGEMENT
+// =====================================================
+pipSize = syminfo.mintick * 10  // Adjust based on instrument
+riskPrice = riskPips * pipSize
+
+var float entryPrice = na
+var float stopPrice  = na
+var float tpPrice    = na
+var bool tradedToday = false
+
+if isNewDay
+    tradedToday := false
+    entryPrice := na
+    stopPrice  := na
+    tpPrice    := na
+
+// =====================================================
+// TRADE EXECUTION
+// =====================================================
+if longEntry and not tradedToday and strategy.position_size == 0
+    entryPrice := htf5m_close  // Use 5-minute close price
+    stopPrice  := orbLow  // Stop loss at ORB low
+    tpPrice    := entryPrice + ((entryPrice - stopPrice) * riskRewardRatio)  // Take profit based on risk:reward ratio
+    
+    strategy.entry("ORB Long", strategy.long, comment="Long Entry")
+    strategy.exit("Long Exit", "ORB Long", stop=stopPrice, limit=tpPrice, comment="Long SL/TP")
+    tradedToday := true
+
+if shortEntry and not tradedToday and strategy.position_size == 0
+    entryPrice := htf5m_close  // Use 5-minute close price
+    stopPrice  := orbHigh  // Stop loss at ORB high
+    tpPrice    := entryPrice - ((stopPrice - entryPrice) * riskRewardRatio)  // Take profit based on risk:reward ratio
+    
+    strategy.entry("ORB Short", strategy.short, comment="Short Entry")
+    strategy.exit("Short Exit", "ORB Short", stop=stopPrice, limit=tpPrice, comment="Short SL/TP")
+    tradedToday := true
+
+// =====================================================
+// PLOTS
+// ===================================================== 
+// plot(orbHigh, "ORB High", color=color.new(color.blue, 0), linewidth=2, style=plot.style_line)
+// plot(orbLow,  "ORB Low",  color=color.new(color.red, 0), linewidth=2, style=plot.style_line)
+// plot(ema10, "EMA 10", color=color.new(color.orange, 0), linewidth=1, style=plot.style_line)
+// plot(ema20, "EMA 20", color=color.new(color.purple, 0), linewidth=1, style=plot.style_line)
+plot(entryPrice, "Entry", color=color.new(color.yellow, 0), linewidth=2, style=plot.style_linebr)
+plot(stopPrice,  "Stop Loss", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+plot(tpPrice,    "Take Profit", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+
+// =====================================================
+// ALERTS
+// =====================================================
+alertcondition(longEntry, title="Long Entry Signal", message="ORB Long Entry: Retest valid + EMA 10 > EMA 20")
+alertcondition(shortEntry, title="Short Entry Signal", message="ORB Short Entry: Retest valid + EMA 10 < EMA 20")
+alertcondition(longRetestClose, title="Long Retest Closed", message="ORB Long retest closed above high on 5m - waiting for EMA confirmation")
+alertcondition(shortRetestClose, title="Short Retest Closed", message="ORB Short retest closed below low on 5m - waiting for EMA confirmation")
