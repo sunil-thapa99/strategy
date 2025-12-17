@@ -22,9 +22,18 @@ riskPips = input.float(50, "Risk (pips)", minval=1, step=1, group="Risk Manageme
 riskRewardRatio = input.float(1.0, "Risk:Reward Ratio", minval=1.0, maxval=5.0, step=0.5, group="Risk Management")
 
 // =====================================================
-// DAY RESET
+// DAY RESET & WEEKEND/HOLIDAY CHECK
 // =====================================================
 isNewDay = dayofmonth != dayofmonth[1]
+dayOfWeek = dayofweek(time, "America/New_York")
+// dayofweek returns: 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+isWeekend = dayOfWeek == 0 or dayOfWeek == 6  // Sunday or Saturday
+
+// Close positions before weekend or on Friday before market close (3 PM EST)
+// Also check if current time is Friday afternoon (after 3 PM EST)
+isFriday = dayOfWeek == 5
+currentHour = hour(time, "America/New_York")
+shouldCloseBeforeWeekend = isWeekend or (isFriday and currentHour >= 15)
 
 // =====================================================
 // ORB — NY SESSION OPEN (9:30 AM EST)
@@ -36,6 +45,7 @@ var bool  breakoutOccurred = false
 var bool  retestValid = false
 var string direction = na
 var bool  waitingForRetest = false
+var bool  tradedToday = false
 
 if isNewDay
     orbHigh := na
@@ -45,9 +55,11 @@ if isNewDay
     retestValid := false
     direction := na
     waitingForRetest := false
+    tradedToday := false
 
 orbStart = timestamp("America/New_York", year, month, dayofmonth, 3, 00)
 orbEnd   = orbStart + orbMinutes * 60 * 1000
+tradeWindowEnd = orbEnd + (2 * 60 * 60 * 1000)  // 2 hours after ORB ends
 
 // Mark ORB High and Low during the 15-minute period
 if time >= orbStart and time <= orbEnd
@@ -56,6 +68,13 @@ if time >= orbStart and time <= orbEnd
 
 if time > orbEnd
     orbDone := true
+
+// Check if we're within the 2-hour trading window
+withinTradeWindow = orbDone and time <= tradeWindowEnd
+
+// If 2-hour window has passed, disable trading for the day
+if time > tradeWindowEnd and not tradedToday
+    tradedToday := true  // Prevent any trades for the rest of the day
 
 // =====================================================
 // 5-MINUTE TIMEFRAME DATA
@@ -148,8 +167,9 @@ emaShortOK = ema10 < ema20  // For short: EMA 10 must be below EMA 20
 // =====================================================
 // ENTRY CONDITIONS
 // =====================================================
-longEntry = retestValid and direction == "long" and emaLongOK
-shortEntry = retestValid and direction == "short" and emaShortOK
+// Only allow entries within 2-hour window and not on weekends
+longEntry = retestValid and direction == "long" and emaLongOK and withinTradeWindow and not isWeekend
+shortEntry = retestValid and direction == "short" and emaShortOK and withinTradeWindow and not isWeekend
 
 // =====================================================
 // RISK MANAGEMENT
@@ -160,10 +180,8 @@ riskPrice = riskPips * pipSize
 var float entryPrice = na
 var float stopPrice  = na
 var float tpPrice    = na
-var bool tradedToday = false
 
 if isNewDay
-    tradedToday := false
     entryPrice := na
     stopPrice  := na
     tpPrice    := na
@@ -188,6 +206,16 @@ if shortEntry and not tradedToday and strategy.position_size == 0
     strategy.entry("ORB Short", strategy.short, comment="Short Entry")
     strategy.exit("Short Exit", "ORB Short", stop=stopPrice, limit=tpPrice, comment="Short SL/TP")
     tradedToday := true
+
+// =====================================================
+// CLOSE POSITIONS BEFORE WEEKEND/HOLIDAYS
+// =====================================================
+// Close all positions before weekend or on Friday afternoon
+if shouldCloseBeforeWeekend and strategy.position_size != 0
+    strategy.close_all(comment="Close before weekend")
+    entryPrice := na
+    stopPrice  := na
+    tpPrice    := na
 
 // =====================================================
 // PLOTS
